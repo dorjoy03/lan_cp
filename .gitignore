@@ -1,0 +1,19 @@
+# emacs backup files
+*~
+
+# object files
+*.o
+
+# test files
+file*
+
+# .info
+.info
+
+# executable files
+cp_send
+cp_receive
+cp_receive_splice
+
+# dir
+dir
