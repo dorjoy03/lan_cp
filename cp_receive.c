@@ -47,7 +47,7 @@ int print_my_ip() {
     //    if (addr->ai_family == AF_INET) { // IPv4
     struct sockaddr_in *ipv4 = (struct sockaddr_in *) addr->ai_addr;
     //    void *res = &(ipv4->sin_addr);
-        //    } /* else { // IPv6 */
+    //    } /* else { // IPv6 */
     /*     struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *) addr->ai_addr; */
     /*     res = &(ipv6->sin6_addr); */
     /* } */
@@ -126,12 +126,6 @@ int main(int argc, char *argv[]) {
     struct sockaddr_storage sender_addr;
     socklen_t addr_size = sizeof(sender_addr);
 
-    int fd = open("dir/test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        perror("Failed to open dir/test");
-        return 1;
-    }
-
     while (true) {
         int sender_fd = accept(sockfd, (struct sockaddr *) &sender_addr,
                                &addr_size);
@@ -143,8 +137,8 @@ int main(int argc, char *argv[]) {
 
         char buf[INET6_ADDRSTRLEN];
         const char *ip = inet_ntop(sender_addr.ss_family,
-                             get_in_addr((struct sockaddr *) &sender_addr),
-                             buf, sizeof(buf));
+                                   get_in_addr((struct sockaddr *) &sender_addr),
+                                   buf, sizeof(buf));
         if (ip == NULL) {
             perror("Failed to get sender ip");
             return 1;
@@ -159,8 +153,7 @@ int main(int argc, char *argv[]) {
                 printf("got total %lu\n", total);
                 break;
             }
-            ssize_t cnt2 = write(fd, arr, (size_t) cnt);
-            total += (uint64_t) cnt2;
+            total += (uint64_t) cnt;
         }
     }
 

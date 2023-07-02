@@ -22,7 +22,7 @@
 #define QD 128 // queue depth
 #define STATX_MASK (STATX_MODE | STATX_SIZE)
 #define OPEN_FLAGS O_RDONLY
-#define OPEN_MODE 0n
+#define OPEN_MODE 0
 
 enum op_type {
     STATX,
@@ -45,6 +45,22 @@ struct loop_info {
     int argc_ind;
     int cur_free_ind; // current free index in op_data_ptrs
     struct op_data *op_data_ptrs[QD];
+};
+
+struct send_data {
+    int fd;
+    uint64_t size;
+};
+
+struct path_info {
+    char *path;
+    size_t len;
+};
+
+struct dir_info {
+    struct path_info *dir_list;
+    size_t len;
+    size_t cur;
 };
 
 static void usage(const char *progname, FILE *f) {
@@ -147,18 +163,59 @@ static void prep_op(struct io_uring *ring, struct op_data *data,
     return;
 }
 
-static int send_file(struct op_data *data, int fd, int sockfd) {
-    uint64_t bytes_left = data->statx_buf.stx_size;
+static int send_file(struct send_data *data, int sockfd) {
+    size_t lim = 2147479552;
+    uint64_t bytes_left = data->size;
     while (bytes_left) {
-        size_t max_count = bytes_left > SIZE_MAX
-            ? SIZE_MAX
-            : (size_t) bytes_left;
-        ssize_t sent = sendfile(sockfd, fd, NULL, max_count);
+        size_t max_count = bytes_left > lim ? lim : (size_t) bytes_left;
+        ssize_t sent = sendfile(sockfd, data->fd, NULL, max_count);
         if (sent < 0) {
             perror("sendfile call failed");
             return -1;
         }
         bytes_left -= (uint64_t) sent;
+    }
+
+    return 0;
+}
+
+int submit_to_ring(struct io_uring *ring, struct loop_info *loop_data) {
+    int ret = io_uring_submit(ring);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to submit to ring: %s\n", strerror(-ret));
+        return -1;
+    }
+    loop_data->to_wait += loop_data->to_submit;
+    loop_data->to_submit = 0;
+    return 0;
+}
+
+int add_to_dirs(const char *path, struct dir_info *dirs) {
+    size_t mx = strlen(path);
+    if (dirs->cur < dirs->len) {
+        char *path = dirs->dir_list[dirs->cur].path;
+        size_t len = dirs->dir_list[dirs->cur].len;
+        char *str = NULL;
+        if (len >= mx + 1) {
+            str = path;
+        } else {
+            str = (char *) realloc(path, mx + 1);
+            if (str == NULL) {
+                perror("Failed to allocate memory");
+                return -1;
+            }
+        }
+        char *dst = strcpy(str, path);
+        dirs->dir_list[dirs->cur].path = dst;
+        dirs->dir_list[dirs->cur].len = mx + 1;
+    } else {
+        struct path_info *new_dir_list = realloc(dirs->dir_list, sizeof(struct path_info) * dirs->len * 2);
+        if (new_dir_list == NULL) {
+            perror("Failed to allocate memory");
+            return -1;
+        }
+        dirs->dir_list = new_dir_list;
+        dirs->len *= 2;
     }
 
     return 0;
@@ -216,6 +273,16 @@ int main(int argc, char *argv[]) {
         loop_data.op_data_ptrs[i] = &(op_datas[i]);
     }
 
+    struct send_data send_datas[QD];
+    int free_send_data_ind = 0;
+
+    struct path_info *dir_paths = (struct path_info*) realloc(NULL, sizeof(struct path_info) * QD);
+    for (int i = 0; i < QD; ++i) {
+        dir_paths[i].path = NULL;
+        dir_paths[i].len = 0;
+    }
+    struct dir_info dirs = {dir_paths, QD, 0};
+
     while (true) {
         if (loop_data.to_submit == 0 && loop_data.to_wait == 0 &&
             loop_data.argc_ind == argc)
@@ -230,70 +297,79 @@ int main(int argc, char *argv[]) {
                 goto err;
             }
             prep_op(&ring, ptr, &loop_data);
-        } else {
-            if (loop_data.to_submit > 0) {
-                ret = io_uring_submit(&ring);
-                if (ret < 0) {
-                    fprintf(stderr, "Failed to submit to ring: %s\n",
-                            strerror(-ret));
-                    goto err;
-                }
-                loop_data.to_wait += loop_data.to_submit;
-                loop_data.to_submit = 0;
-            }
+            continue;
+        }
 
-            struct io_uring_cqe *cqe;
-            ret = io_uring_wait_cqe(&ring, &cqe);
-            if (ret < 0) {
-                fprintf(stderr, "Failed to get completion: %s\n",
-                        strerror(-ret));
+        if (loop_data.to_submit > 0) {
+            ret = submit_to_ring(&ring, &loop_data);
+            if (ret != 0)
                 goto err;
+        }
+
+        struct io_uring_cqe *cqe;
+        ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            fprintf(stderr, "Failed to get completion: %s\n",
+                    strerror(-ret));
+            goto err;
+        }
+        struct op_data *data = io_uring_cqe_get_data(cqe);
+        if (cqe->res < 0) { // failed
+            if (cqe->res == -EAGAIN) {
+                prep_op(&ring, data, &loop_data);
+            } else if (data->type != CLOSE) {
+                char *op = data->type == STATX ? "stat" : "open";
+                fprintf(stdout, "Skipping %s. Failed to %s.\n", data->path, op);
             }
-            struct op_data *data = io_uring_cqe_get_data(cqe);
-            if (cqe->res < 0) { // failed
-                if (cqe->res == -EAGAIN) {
+        } else { // succeeded
+            switch (data->type) {
+            case STATX:
+                if (S_ISREG(data->statx_buf.stx_mode)) {
+                    // let's reuse the data pointer for async open
+                    data->type = OPEN;
                     prep_op(&ring, data, &loop_data);
-                } else if (data->type != CLOSE) {
-                    char *op = data->type == STATX ? "stat" : "open";
-                    fprintf(stdout, "Skipping %s. Failed to %s.\n", data->path,
-                            op);
-                }
-            } else { // succeeded
-                switch (data->type) {
-                case STATX:
-                    if (S_ISREG(data->statx_buf.stx_mode)) {
-                        // let's reuse the data pointer for async open
-                        data->type = OPEN;
-                        prep_op(&ring, data, &loop_data);
-                    } else if (S_ISDIR(data->statx_buf.stx_mode)) {
-                        // not implemented yet
-                    } else {
-                        fprintf(stdout, "Skipping %s. Not a regular file or "
-                                "folder\n", data->path);
-                    }
-                    break;
-                case OPEN:
-                    ret = send_file(data, cqe->res, sockfd);
-                    if (ret != 0) {
-                        fprintf(stderr, "Failed to send file %s. Exiting\n",
-                                data->path);
+                } else if (S_ISDIR(data->statx_buf.stx_mode)) {
+                    // not implemented yet
+                    ret = add_to_dirs(data->path, dirs);
+                    if (ret == -1) {
+                        fprintf(stderr, "Failed to add dir\n");
                         goto err;
                     }
-                    data->type = CLOSE;
-                    data->fd = cqe->res;
-                    prep_op(&ring, data, &loop_data);
-                    break;
-                case CLOSE:
-                    loop_data.op_data_ptrs[--loop_data.cur_free_ind] = data;
-                    break;
-                default:
-                    fprintf(stderr, "Unexpected op type\n");
-                    goto err;
+                } else {
+                    fprintf(stdout, "Skipping %s. Not a regular file or "
+                            "directory\n", data->path);
                 }
+                break;
+            case OPEN:
+                if (free_send_data_ind == QD) {
+                    for (int i = 0; i < QD; ++i) {
+                        ret = send_file(&send_datas[i], sockfd);
+                        if (ret != 0)
+                            goto err;
+                    }
+                    free_send_data_ind = 0;
+                }
+                send_datas[free_send_data_ind].fd = cqe->res;
+                send_datas[free_send_data_ind].size = data->statx_buf.stx_size;
+                free_send_data_ind++;
+                loop_data.op_data_ptrs[--loop_data.cur_free_ind] = data;
+                break;
+            case CLOSE:
+                loop_data.op_data_ptrs[--loop_data.cur_free_ind] = data;
+                break;
+            default:
+                fprintf(stderr, "Unexpected op type\n");
+                goto err;
             }
-            io_uring_cqe_seen(&ring, cqe);
-            loop_data.to_wait--;
         }
+        io_uring_cqe_seen(&ring, cqe);
+        loop_data.to_wait--;
+    }
+
+    for (int i = 0; i < free_send_data_ind; ++i) {
+        ret = send_file(&send_datas[i], sockfd);
+        if (ret != 0)
+            goto err;
     }
 
     io_uring_queue_exit(&ring);

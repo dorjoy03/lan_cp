@@ -14,6 +14,12 @@ file*
 cp_send
 cp_receive
 cp_receive_splice
+cp_receive_uring
+cp_send_file
+cp_send_normal
+cp_send_splice
+cp_send_test
+cp_send_uring
 
 # dir
 dir

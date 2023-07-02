@@ -7,7 +7,6 @@
 #include <fcntl.h>
 #include <assert.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <liburing.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -16,11 +15,18 @@
 
 #include "common.h"
 
-#define QD 128
+#define QD 4096
 
 enum op_type {
-    SOCKET_TO_PIPE,
-    PIPE_TO_FILE,
+    SOCKET_IO,
+    FILE_IO,
+};
+
+struct type_data {
+    enum op_type type;
+    void *buf;
+    size_t len;
+    uint64_t offset;
 };
 
 static void usage(const char *progname, FILE *f) {
@@ -54,7 +60,7 @@ int print_my_ip() {
         return -1;
     }
 
-    char buf[INET_ADDRSTRLEN];
+    char buffer[INET_ADDRSTRLEN];
     //    if (addr->ai_family == AF_INET) { // IPv4
     struct sockaddr_in *ipv4 = (struct sockaddr_in *) addr->ai_addr;
     //    void *res = &(ipv4->sin_addr);
@@ -63,7 +69,7 @@ int print_my_ip() {
     /*     res = &(ipv6->sin6_addr); */
     /* } */
 
-    const char *ip = inet_ntop(addr->ai_family, &(ipv4->sin_addr), buf, sizeof(buf));
+    const char *ip = inet_ntop(addr->ai_family, &(ipv4->sin_addr), buffer, sizeof(buffer));
     if (ip == NULL) {
         perror("Failed to inet_ntop");
         return -1;
@@ -134,13 +140,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int pipes[2];
-    ret = pipe(pipes);
+    /* int pipes[2]; */
+    /* ret = pipe(pipes); */
 
-    if (ret != 0) {
-        perror("Failed to create pipe");
-        return 1;
-    }
+    /* if (ret != 0) { */
+    /*     perror("Failed to create pipe"); */
+    /*     return 1; */
+    /* } */
 
     /* int check = fcntl(pipes[0], F_GETPIPE_SZ); */
     /* printf("0 size %d\n", check); */
@@ -166,10 +172,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    char buf[INET6_ADDRSTRLEN];
+    char buffer[INET6_ADDRSTRLEN];
     const char *ip = inet_ntop(sender_addr.ss_family,
                                get_in_addr((struct sockaddr *) &sender_addr),
-                               buf, sizeof(buf));
+                               buffer, sizeof(buffer));
     if (ip == NULL) {
         perror("Failed to get sender ip");
         return 1;
@@ -202,31 +208,53 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    unsigned int size = 16 * 4096;
-    /* unsigned int size = UINT_MAX; */
-    /* printf("max uint %u\n", size); */
+    size_t len = 65536;
+    void *buf = malloc(len * QD);
+    if (buf == NULL) {
+        fprintf(stderr, "Failed to allocate memory\n");
+        return 1;
+    }
 
-    enum op_type socket_to_pipe = SOCKET_TO_PIPE;
-    enum op_type pipe_to_file = PIPE_TO_FILE;
+    void *free_bufs[QD];
+    for (int i = 0; i < QD; ++i) {
+        free_bufs[i] = buf + (size_t) i * len;
+    }
 
-    struct io_uring_sqe *sqe1 = io_uring_get_sqe(&ring);
-    assert(sqe1);
-    io_uring_prep_splice(sqe1, sender_fd, -1, pipes[1], -1, size, 0);
-    io_uring_sqe_set_data(sqe1, &socket_to_pipe);
+    int free_bufs_ind = 0;
 
-    struct io_uring_sqe *sqe2 = io_uring_get_sqe(&ring);
-    assert(sqe2);
-    io_uring_prep_splice(sqe2, pipes[0], -1, fd, -1, size, 0);
-    io_uring_sqe_set_data(sqe2, &pipe_to_file);
+    struct type_data datas[QD];
+    struct type_data *free_datas[QD];
+    for (int i = 0; i < QD; ++i) {
+        free_datas[i] = &datas[i];
+    }
+    int free_datas_ind = 0;
 
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    assert(sqe);
+
+    struct type_data *tmp = free_datas[free_datas_ind++];
+    tmp->buf = free_bufs[free_bufs_ind++];
+    tmp->len = len;
+    tmp->type = SOCKET_IO;
+
+    io_uring_prep_recv(sqe, sender_fd, tmp->buf, len, 0);
+    io_uring_sqe_set_data(sqe, tmp);
     ret = io_uring_submit(&ring);
+
     if (ret < 0) {
         fprintf(stderr, "Failed to submit to ring: %s\n",
                 strerror(-ret));
         return 1;
     }
 
+    uint64_t cur_off = 0;
+    //    int cnt = 0;
+
     while (true) {
+        bool cqe_seen = false;
+        bool submit = false;
+        //  ++cnt;
+        //        printf("here %d\n", cnt);
         struct io_uring_cqe *cqe;
         ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret < 0) {
@@ -235,20 +263,22 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        enum op_type *data = io_uring_cqe_get_data(cqe);
+        struct type_data *data = io_uring_cqe_get_data(cqe);
 
         if (cqe->res < 0) { // failed
             if (cqe->res == -EAGAIN) {
-                if (*data == socket_to_pipe) {
+                submit = true;
+                if (data->type == SOCKET_IO) {
                     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                     assert(sqe);
-                    io_uring_prep_splice(sqe, sender_fd, -1, pipes[1], -1, size, 0);
-                    io_uring_sqe_set_data(sqe, &socket_to_pipe);
+                    io_uring_prep_recv(sqe, sender_fd, data->buf, len, 0);
+                    io_uring_sqe_set_data(sqe, data);
                 } else {
                     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                     assert(sqe);
-                    io_uring_prep_splice(sqe, pipes[0], -1, fd, -1, size, 0);
-                    io_uring_sqe_set_data(sqe, &pipe_to_file);
+                    io_uring_prep_write(sqe, fd, data->buf, (unsigned) data->len,
+                                        data->offset);
+                    io_uring_sqe_set_data(sqe, data);
                 }
             } else {
                 fprintf(stderr, "failed operaion in io: %s\n",
@@ -260,28 +290,63 @@ int main(int argc, char *argv[]) {
                 fprintf(stdout, "got 0\n");
                 return 1;
             }
-            if (*data == socket_to_pipe) {
-                //printf("socket to pipe res %d\n", cqe->res);
+            if (data->type == SOCKET_IO) {
+                //                printf("here at socket_io\n");
+                if (free_datas_ind == QD) {
+                    //printf("here at free_datas_ind check\n");
+                    io_uring_cqe_seen(&ring, cqe);
+                    cqe_seen = true;
+                    struct io_uring_cqe *cqein;
+                    ret = io_uring_wait_cqe(&ring, &cqein);
+                    if (ret < 0) {
+                        fprintf(stderr, "Failed to get completion: %s\n",
+                                strerror(-ret));
+                        return 1;
+                    }
+                    struct type_data *ptr = io_uring_cqe_get_data(cqein);
+                    //printf("type = %d\n", ptr->type);
+                    assert(ptr->type == FILE_IO);
+                    free_datas[--free_datas_ind] = ptr;
+                    free_bufs[--free_bufs_ind] = ptr->buf;
+                    io_uring_cqe_seen(&ring, cqein);
+                }
+                //printf("here at sqe\n");
                 struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
                 assert(sqe);
-                io_uring_prep_splice(sqe, sender_fd, -1, pipes[1], -1, size, 0);
-                io_uring_sqe_set_data(sqe, &socket_to_pipe);
+                struct type_data *tmp = free_datas[free_datas_ind++];
+                tmp->buf = data->buf;
+                tmp->len = (size_t) cqe->res;
+                tmp->type = FILE_IO;
+                tmp->offset = cur_off;
+                cur_off += (uint64_t) cqe->res;
+                io_uring_prep_write(sqe, fd, tmp->buf, (unsigned) tmp->len, tmp->offset);
+                io_uring_sqe_set_data(sqe, tmp);
+
+                data->buf = free_bufs[free_bufs_ind++];
+
+                struct io_uring_sqe *sqe2 = io_uring_get_sqe(&ring);
+                assert(sqe2);
+                io_uring_prep_recv(sqe2, sender_fd, data->buf, len, 0);
+                io_uring_sqe_set_data(sqe2, data);
+                submit = true;
             } else {
-                //printf("pipe to socket res %d\n", cqe->res);
-                struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-                assert(sqe);
-                io_uring_prep_splice(sqe, pipes[0], -1, fd, -1, size, 0);
-                io_uring_sqe_set_data(sqe, &pipe_to_file);
+                //printf("here at free\n");
+                free_datas[--free_datas_ind] = data;
+                free_bufs[--free_bufs_ind] = data->buf;
             }
         }
 
-        io_uring_cqe_seen(&ring, cqe);
-
-        ret = io_uring_submit(&ring);
-        if (ret < 0) {
-            fprintf(stderr, "Failed to submit to ring: %s\n",
-                    strerror(-ret));
-            return 1;
+        if (!cqe_seen) {
+            io_uring_cqe_seen(&ring, cqe);
+        }
+        //printf("here at sbumit\n");
+        if (submit) {
+            ret = io_uring_submit(&ring);
+            if (ret < 0) {
+                fprintf(stderr, "Failed to submit to ring: %s\n",
+                        strerror(-ret));
+                return 1;
+            }
         }
     }
 
